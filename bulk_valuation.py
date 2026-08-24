@@ -476,16 +476,61 @@ def render_bulk_valuation_ui(
     with tab_pick:
         load_err_nse = tdu.get_load_error("NSE")
         load_err_bse = tdu.get_load_error("BSE")
-        options = tdu.get_peer_display_options()
-        if not options:
+        all_options = tdu.get_peer_display_options()
+        if not all_options:
             st.error(
                 "Couldn't load the NSE/BSE reference lists. "
                 f"NSE error: {load_err_nse or 'n/a'} | BSE error: {load_err_bse or 'n/a'}"
             )
         else:
+            exch_choice = st.radio(
+                "List", ["Both", "NSE only", "BSE only"], horizontal=True, key="bulk_exch_choice",
+            )
+            if exch_choice == "NSE only":
+                options = [o for o in all_options if "(NSE:" in o]
+            elif exch_choice == "BSE only":
+                options = [o for o in all_options if "(BSE:" in o]
+            else:
+                options = all_options
+            st.caption(f"{len(options)} companies in this list, sorted alphabetically by name.")
+
+            # NOTE on the pattern below: once a widget has a `key`, Streamlit
+            # ignores `default=` on every rerun after the first — the keyed
+            # session_state entry is the only source of truth from then on.
+            # So "Add range" must write into st.session_state["bulk_multiselect"]
+            # directly (before the multiselect widget is instantiated further
+            # down in this same script run), not into a separate variable.
+            if "bulk_multiselect" not in st.session_state:
+                st.session_state.bulk_multiselect = []
+            # Prior selections that fell outside the current NSE/BSE filter
+            # would otherwise trip Streamlit's "default value not in options"
+            # error — drop anything not in the currently visible list.
+            st.session_state.bulk_multiselect = [o for o in st.session_state.bulk_multiselect if o in options]
+
+            rc1, rc2, rc3 = st.columns([1, 1, 1.4])
+            with rc1:
+                range_from = st.number_input(
+                    "From #", min_value=1, max_value=max(len(options), 1), value=1, key="bulk_range_from",
+                )
+            with rc2:
+                range_to = st.number_input(
+                    "To #", min_value=1, max_value=max(len(options), 1),
+                    value=min(20, len(options)) or 1, key="bulk_range_to",
+                )
+            with rc3:
+                st.markdown("&nbsp;")
+                if st.button("➕ Add range to selection", key="bulk_add_range"):
+                    lo, hi = sorted([int(range_from), int(range_to)])
+                    picked_slice = options[lo - 1: hi]
+                    st.session_state.bulk_multiselect = list(
+                        dict.fromkeys(st.session_state.bulk_multiselect + picked_slice)
+                    )
+                    st.toast(f"Added {len(picked_slice)} companies (#{lo}–{hi} of the {exch_choice.lower()} list).")
+
             picked_display = st.multiselect(
-                "Search and select companies (type to filter)",
+                "Search and select companies (type to filter, or use the range picker above)",
                 options=options,
+                key="bulk_multiselect",
                 help="Sourced from NSE_Tickers_List.csv / BSE_Codes_List.csv in the repo.",
             )
 
