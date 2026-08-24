@@ -5503,8 +5503,16 @@ def calculate_peer_unlevered_beta(peer_tickers, target_financials, tax_rate, per
 
 
 def calculate_wacc(financials, tax_rate, peer_tickers=None, manual_rf_rate=None, manual_rm_rate=None,
-                   beta_start_date=None, beta_end_date=None):
-    """Calculate WACC with proper beta calculation from peers"""
+                   beta_start_date=None, beta_end_date=None, manual_beta=None):
+    """Calculate WACC with proper beta calculation from peers.
+
+    manual_beta: if provided (not None), this beta is used directly and the
+    entire peer-based Hamada unlever/relever calculation is skipped — no
+    peer_tickers required, no st.* UI emitted for the beta section. Used by
+    Bulk Valuation mode, which applies one user-supplied beta across every
+    company in a batch instead of computing it per company. Existing callers
+    that don't pass manual_beta are completely unaffected.
+    """
     # Cost of Equity (Ke)
     # ALWAYS use manual rates (passed from session state), never fetch
     rf = manual_rf_rate if manual_rf_rate is not None else 6.83
@@ -5513,7 +5521,10 @@ def calculate_wacc(financials, tax_rate, peer_tickers=None, manual_rf_rate=None,
     # ── Beta: unlever peer betas → average → relever for target ──────────
     beta = 1.0
     beta_details = {}
-    if peer_tickers and peer_tickers.strip():
+    if manual_beta is not None:
+        beta = float(manual_beta)
+        beta_details = {'source': 'manual', 'manual_beta': beta}
+    elif peer_tickers and peer_tickers.strip():
         st.markdown("#### 🔢 Beta Calculation (Hamada Unlevering / Relevering)")
         if beta_start_date and beta_end_date:
             _bd_label = f"{pd.Timestamp(beta_start_date).strftime('%d-%b-%Y')} → {pd.Timestamp(beta_end_date).strftime('%d-%b-%Y')}"
@@ -6346,10 +6357,22 @@ def main():
     mode = st.radio("Select Mode:", 
                     ["Listed Company (Yahoo Finance)", 
                      "Unlisted Company (Excel Upload)",
-                     "Screener Excel Mode (Screener.in Template)"], 
+                     "Screener Excel Mode (Screener.in Template)",
+                     "Bulk Valuation (Screener Web)"], 
                     horizontal=True)
 
-    if mode == "Listed Company (Yahoo Finance)":
+    if mode == "Bulk Valuation (Screener Web)":
+        from bulk_valuation import render_bulk_valuation_ui
+        render_bulk_valuation_ui(
+            classify_business_model=classify_business_model,
+            calculate_working_capital_metrics=calculate_working_capital_metrics,
+            project_financials=project_financials,
+            calculate_wacc=calculate_wacc,
+            calculate_dcf_valuation=calculate_dcf_valuation,
+            ensure_valid_number=ensure_valid_number,
+        )
+
+    elif mode == "Listed Company (Yahoo Finance)":
         st.subheader("📈 Listed Company Valuation")
 
         # ===== VALUATION DATE — controls what "today" means for Rf, Rm, and =====
