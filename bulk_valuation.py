@@ -186,6 +186,63 @@ def _find_table_by_heading(soup, heading_keywords):
     return None
 
 
+def _table_header_years(table):
+    """Column headers of a table's first row, e.g. ['Mar 2015', ..., 'TTM']."""
+    if table is None:
+        return []
+    first_row = table.find("tr")
+    if first_row is None:
+        return []
+    return [c.get_text(strip=True) for c in first_row.find_all(["td", "th"])]
+
+
+def _is_annual_table(table) -> bool:
+    """Screener's annual P&L/BS tables span many 'Mon YYYY' columns (often
+    10-12 years) and the P&L one ends in 'TTM'. The Quarterly Results table
+    only ever has ~8-13 recent quarters and never 'TTM'. A wide span of
+    distinct years is what actually distinguishes them — both use 'Mar' in
+    column labels, so checking for the word alone isn't enough."""
+    headers = _table_header_years(table)
+    if not headers:
+        return False
+    years_seen = set(re.findall(r"(20\d{2})", " ".join(headers)))
+    return len(years_seen) >= 5  # quarterly tables cover at most ~3-4 distinct years
+
+
+def _find_screener_section_table(soup, section_id: str, heading_keywords, must_be_annual: bool):
+    """Primary strategy: Screener's real page anchors each section with a
+    stable id (id="profit-loss", id="balance-sheet" — visible in the page's
+    own nav links). That's far more reliable than matching on heading text
+    or table position, and is what fixes a real bug found on RELIANCE: the
+    Quarterly Results table sits *before* the annual Profit & Loss table in
+    the DOM, so a naive 'first table found' or fragile heading-sibling
+    search can silently grab quarterly figures instead of annual ones —
+    producing wildly inconsistent errors from company to company (exactly
+    the 'random-looking' pattern reported), not a uniform scale error."""
+    table = None
+    section = soup.find(id=section_id)
+    if section is not None:
+        table = section.find("table") if section.name != "table" else section
+        if table is None:
+            table = section.find_next("table")
+
+    if table is None or (must_be_annual and not _is_annual_table(table)):
+        # Fall back to heading-text search, but only accept it if it also
+        # passes the annual-vs-quarterly content check (when applicable).
+        candidate = _find_table_by_heading(soup, heading_keywords)
+        if candidate is not None and (not must_be_annual or _is_annual_table(candidate)):
+            table = candidate
+
+    if must_be_annual and table is not None and not _is_annual_table(table):
+        # Last resort: scan every table on the page for one that both
+        # matches the keywords nearby AND looks annual. Never silently fall
+        # back to "first table on the page" — that's exactly how quarterly
+        # data slipped in undetected before.
+        table = None
+
+    return table
+
+
 def _parse_row(table, keywords):
     if table is None:
         return []
@@ -223,18 +280,18 @@ def _pad(lst, n):
     return lst[-n:]
 
 
-def _extract_current_price_from_soup(soup) -> Optional[float]:
-    """Best-effort parse of Screener's 'Current Price' ratio, which sits in
-    the top ratio list. Multiple strategies since Screener's exact markup
-    can shift; every strategy is defensive and returns None (never raises)
-    on no match, so this can never be the reason a company's DCF result
-    fails — it only affects the price-comparison display."""
+def _extract_ratio_value(soup, label: str) -> Optional[float]:
+    """Best-effort parse of a labeled value in Screener's top ratio list
+    (e.g. 'Current Price', 'Market Cap'). Multiple strategies since Screener's
+    exact markup can shift; every strategy is defensive and returns None
+    (never raises) on no match."""
+    label_lower = label.lower()
     try:
         for li in soup.find_all("li"):
             name_el = li.find(class_=re.compile("name"))
             if not name_el:
                 continue
-            if "current price" not in name_el.get_text(strip=True).lower():
+            if label_lower not in name_el.get_text(strip=True).lower():
                 continue
             num_el = li.find(class_=re.compile("number"))
             if num_el:
@@ -243,8 +300,7 @@ def _extract_current_price_from_soup(soup) -> Optional[float]:
                     return float(raw)
                 except ValueError:
                     pass
-            # Fallback: any digits inside this <li>
-            m = re.search(r"[\d,]+\.?\d*", li.get_text(" ", strip=True).replace("Current Price", ""))
+            m = re.search(r"[\d,]+\.?\d*", li.get_text(" ", strip=True).replace(label, ""))
             if m:
                 try:
                     return float(m.group(0).replace(",", ""))
@@ -252,15 +308,36 @@ def _extract_current_price_from_soup(soup) -> Optional[float]:
                     pass
     except Exception:
         pass
-    # Last-resort: regex the whole page text near the phrase
     try:
         text = soup.get_text(" ", strip=True)
-        m = re.search(r"Current Price\D{0,15}?([\d,]+\.\d{1,2})", text)
+        m = re.search(re.escape(label) + r"\D{0,15}?([\d,]+\.?\d{0,2})", text)
         if m:
             return float(m.group(1).replace(",", ""))
     except Exception:
         pass
     return None
+
+
+def _extract_current_price_from_soup(soup) -> Optional[float]:
+    """Screener's 'Current Price' ratio — only affects the price-comparison
+    display, never blocks a DCF result if it comes back None."""
+    return _extract_ratio_value(soup, "Current Price")
+
+
+def _extract_shares_from_market_cap(soup, price: Optional[float]) -> Optional[int]:
+    """Shares outstanding = Market Cap ÷ Current Price, both already printed
+    on the page. Preferred over back-solving from Net Profit ÷ EPS, which
+    overstates share count for companies with material minority interests
+    (consolidated Net Profit includes minority profit; EPS doesn't) — e.g.
+    for RELIANCE this formula gives ~1,363 Cr shares (matches Screener's own
+    Market Cap ÷ Price), while Net Profit/EPS overstates it to ~1,597 Cr."""
+    mcap_cr = _extract_ratio_value(soup, "Market Cap")
+    if mcap_cr is None or not price or price <= 0:
+        return None
+    try:
+        return int((mcap_cr * 1_00_00_000) / price)  # ₹ Cr -> ₹, then / price
+    except Exception:
+        return None
 
 
 def _parse_screener_page(soup, num_years: int):
@@ -271,12 +348,15 @@ def _parse_screener_page(soup, num_years: int):
     title_tag = soup.find("h1")
     company_name = title_tag.get_text(strip=True) if title_tag else ""
 
-    all_tables = soup.find_all("table")
-    pl_table = _find_table_by_heading(soup, ["profit", "loss"]) or (all_tables[0] if all_tables else None)
-    bs_table = _find_table_by_heading(soup, ["balance", "sheet"]) or (all_tables[1] if len(all_tables) > 1 else None)
+    pl_table = _find_screener_section_table(soup, "profit-loss", ["profit", "loss"], must_be_annual=True)
+    bs_table = _find_screener_section_table(soup, "balance-sheet", ["balance", "sheet"], must_be_annual=False)
 
     if pl_table is None or bs_table is None:
-        return None, 0, company_name, "No P&L/Balance Sheet tables found on page"
+        return None, 0, company_name, (
+            "Could not confidently locate the annual Profit & Loss / Balance Sheet tables "
+            "(section anchors missing and heading-based search either found nothing or "
+            "matched what looks like the Quarterly Results table instead of annual data)."
+        )
 
     raw_revenue = _parse_row(pl_table, ["revenue", "sales"])
     raw_interest = _parse_row(pl_table, ["interest"])
@@ -322,11 +402,19 @@ def _parse_screener_page(soup, num_years: int):
     cash_vals = _pad(raw_cash, n)
     inventory_vals = _pad(raw_inventory, n)
 
-    shares = 0
-    for i in range(n - 1, -1, -1):
-        if eps[i] != 0 and net_profit[i] != 0:
-            shares = int((net_profit[i] * 10_000_000) / eps[i])
-            break
+    price_for_shares = _extract_current_price_from_soup(soup)
+    shares = _extract_shares_from_market_cap(soup, price_for_shares) or 0
+    shares_source = "Market Cap ÷ Price" if shares else ""
+    if not shares:
+        # Fallback: back-solve from Net Profit ÷ EPS. Less accurate for
+        # companies with material minority interests (consolidated Net
+        # Profit includes minority profit; EPS doesn't), but works when
+        # Market Cap isn't parseable from the page.
+        for i in range(n - 1, -1, -1):
+            if eps[i] != 0 and net_profit[i] != 0:
+                shares = int((net_profit[i] * 10_000_000) / eps[i])
+                shares_source = "Net Profit ÷ EPS (fallback)"
+                break
 
     financials_out = {
         "years": [str(datetime.now().year - i) for i in range(n)],
@@ -386,7 +474,7 @@ def _parse_screener_page(soup, num_years: int):
         financials_out["st_debt"].append(borrow_val * 0.40)
         financials_out["lt_debt"].append(borrow_val * 0.60)
 
-    return financials_out, shares, company_name, None
+    return financials_out, shares, company_name, shares_source, None
 
 
 def fetch_screener_bulk(symbol: str, num_years: int, session: requests.Session):
@@ -403,11 +491,11 @@ def fetch_screener_bulk(symbol: str, num_years: int, session: requests.Session):
         if soup is None:
             log.append(f"{label}: fetch failed — {fetch_err}")
             continue
-        financials, shares, company_name, parse_err = _parse_screener_page(soup, num_years)
+        financials, shares, company_name, shares_source, parse_err = _parse_screener_page(soup, num_years)
         if financials is None:
             log.append(f"{label}: {parse_err} — trying next source" if label == "Consolidated" else f"{label}: {parse_err}")
             continue
-        log.append(f"{label}: parsed OK ({len(financials['years'])} yrs)")
+        log.append(f"{label}: parsed OK ({len(financials['years'])} yrs); shares via {shares_source or 'unresolved'}")
         price = _extract_current_price_from_soup(soup)
         return {
             "financials": financials, "shares": shares, "company_name": company_name or symbol,
