@@ -69,7 +69,12 @@ except Exception:
     _HAS_BSE_QUOTE = False
 
 
-CR_TO_LAC = 10.0  # Screener publishes ₹ Crores; the shared DCF engine works in ₹ Lacs
+CR_TO_LAC = 100.0  # Screener publishes ₹ Crores; the shared DCF engine works in ₹ Lacs.
+                    # 1 Crore = 100 Lacs (confirmed against screener_excel_mode.py's
+                    # `revenue * 100` conversion, the path your working Excel-upload
+                    # mode uses). Do NOT change this back to 10 — that was a bug
+                    # inherited from a stale comment in utils_indian_apis.py and is
+                    # what caused every monetary figure here to be 10x too small.
 SCREENER_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -378,8 +383,8 @@ def _parse_screener_page(soup, num_years: int):
         financials_out["payables"].append(pay_val)
         financials_out["cash"].append(cash_val)
         financials_out["equity"].append(eq_val)
-        financials_out["st_debt"].append(borrow_val * 0.30)
-        financials_out["lt_debt"].append(borrow_val * 0.70)
+        financials_out["st_debt"].append(borrow_val * 0.40)
+        financials_out["lt_debt"].append(borrow_val * 0.60)
 
     return financials_out, shares, company_name, None
 
