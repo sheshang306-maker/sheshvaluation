@@ -5503,16 +5503,8 @@ def calculate_peer_unlevered_beta(peer_tickers, target_financials, tax_rate, per
 
 
 def calculate_wacc(financials, tax_rate, peer_tickers=None, manual_rf_rate=None, manual_rm_rate=None,
-                   beta_start_date=None, beta_end_date=None, manual_beta=None):
-    """Calculate WACC with proper beta calculation from peers.
-
-    manual_beta: if provided (not None), this beta is used directly and the
-    entire peer-based Hamada unlever/relever calculation is skipped — no
-    peer_tickers required, no st.* UI emitted for the beta section. Used by
-    Bulk Valuation mode, which applies one user-supplied beta across every
-    company in a batch instead of computing it per company. Existing callers
-    that don't pass manual_beta are completely unaffected.
-    """
+                   beta_start_date=None, beta_end_date=None):
+    """Calculate WACC with proper beta calculation from peers"""
     # Cost of Equity (Ke)
     # ALWAYS use manual rates (passed from session state), never fetch
     rf = manual_rf_rate if manual_rf_rate is not None else 6.83
@@ -5521,10 +5513,7 @@ def calculate_wacc(financials, tax_rate, peer_tickers=None, manual_rf_rate=None,
     # ── Beta: unlever peer betas → average → relever for target ──────────
     beta = 1.0
     beta_details = {}
-    if manual_beta is not None:
-        beta = float(manual_beta)
-        beta_details = {'source': 'manual', 'manual_beta': beta}
-    elif peer_tickers and peer_tickers.strip():
+    if peer_tickers and peer_tickers.strip():
         st.markdown("#### 🔢 Beta Calculation (Hamada Unlevering / Relevering)")
         if beta_start_date and beta_end_date:
             _bd_label = f"{pd.Timestamp(beta_start_date).strftime('%d-%b-%Y')} → {pd.Timestamp(beta_end_date).strftime('%d-%b-%Y')}"
@@ -6200,6 +6189,374 @@ def calculate_dcf_valuation(projections, wacc_details, terminal_growth, num_shar
         'wacc': wacc,
         'discount_rate_source': discount_rate_source
     }, None
+
+
+def render_scenario_settings_ui(key_prefix, default_pct=10.0):
+    """
+    Scenario Analysis INPUT controls, rendered ABOVE the Run Valuation
+    button so the choice is locked in before the model runs.
+
+    Lets the user pick which case to spotlight by default, how big a swing
+    (%) to apply, and which of the five levers (Revenue Growth, EBITDA
+    Margin, WACC, CapEx Ratio, Working Capital) should move across
+    scenarios. Returns (default_case, override_pct, flex_drivers_set).
+    """
+    with st.expander("🎭 Scenario Analysis Settings (Base / Best / Worst)", expanded=False):
+        st.caption(
+            "All three cases are always computed and shown side-by-side in the "
+            "Scenario Analysis tab after you run the valuation. This just sets "
+            "the swing size, which levers move, and which case opens by default."
+        )
+        col_a, col_b = st.columns(2)
+        with col_a:
+            default_case = st.selectbox(
+                "Default case to open:", ["Base Case", "Best Case", "Worst Case"],
+                index=0, key=f"{key_prefix}_case"
+            )
+        with col_b:
+            override_pct = st.number_input(
+                "Adjustment % (applied to every selected lever):",
+                min_value=0.5, max_value=100.0, value=default_pct, step=0.5,
+                key=f"{key_prefix}_pct",
+                help="Best case moves each selected lever this % in the favorable "
+                     "direction; Worst case moves it this % unfavorably."
+            )
+        driver_labels = st.multiselect(
+            "Levers to flex across scenarios:",
+            ["Revenue Growth", "EBITDA Margin", "WACC", "CapEx Ratio", "Working Capital"],
+            default=["Revenue Growth", "EBITDA Margin", "WACC", "CapEx Ratio", "Working Capital"],
+            key=f"{key_prefix}_drivers",
+            help="Unchecked levers stay fixed at the base-case value in every scenario."
+        )
+        label_to_key = {
+            'Revenue Growth': 'growth', 'EBITDA Margin': 'ebitda_margin',
+            'WACC': 'wacc', 'CapEx Ratio': 'capex_ratio', 'Working Capital': 'wc_pct'
+        }
+        flex_drivers = {label_to_key[l] for l in driver_labels}
+    return default_case, override_pct, flex_drivers
+
+
+# Direction a "favorable" (Best Case) move takes each lever, relative to base.
+# Revenue growth & EBITDA margin: UP is favorable. WACC, CapEx ratio, and
+# Working Capital: DOWN is favorable (cheaper capital / less cash tied up).
+_SCENARIO_DRIVER_DIRECTION = {
+    'growth': +1,
+    'ebitda_margin': +1,
+    'wacc': -1,
+    'capex_ratio': -1,
+    'wc_pct': -1,
+}
+_SCENARIO_DRIVER_LABELS = {
+    'growth': 'Revenue Growth',
+    'ebitda_margin': 'EBITDA Margin',
+    'wacc': 'WACC',
+    'capex_ratio': 'CapEx Ratio',
+    'wc_pct': 'Working Capital (% Rev)',
+}
+
+
+def _scenario_driver_value(base_value, key, case_sign, override_pct, flex_drivers):
+    """case_sign: +1 = Best Case, -1 = Worst Case, 0 = Base Case (or driver not flexed)."""
+    if case_sign == 0 or key not in flex_drivers:
+        return base_value
+    direction = _SCENARIO_DRIVER_DIRECTION[key]
+    factor = 1 + (case_sign * direction * override_pct / 100.0)
+    return base_value * factor
+
+
+def _run_scenario_point(financials, wc_metrics, years, tax_rate,
+                         growth, ebitda_margin, wacc_pct, capex_ratio, wc_pct,
+                         terminal_growth, num_shares, cash_balance,
+                         depreciation_rate_override=None, depreciation_method="Auto",
+                         inventory_days_override=None, debtor_days_override=None,
+                         creditor_days_override=None, interest_rate_override=None):
+    """Runs ONE DCF point for an explicit set of driver values (not factors)."""
+    try:
+        proj, drv = project_financials(
+            financials, wc_metrics, years, tax_rate,
+            rev_growth_override=growth,
+            opex_margin_override=None,
+            capex_ratio_override=capex_ratio,
+            ebitda_margin_override=ebitda_margin,
+            depreciation_rate_override=depreciation_rate_override,
+            depreciation_method=depreciation_method,
+            inventory_days_override=inventory_days_override,
+            debtor_days_override=debtor_days_override,
+            creditor_days_override=creditor_days_override,
+            interest_rate_override=interest_rate_override,
+            working_capital_pct_override=wc_pct
+        )
+        val, err = calculate_dcf_valuation(
+            proj, {'wacc': wacc_pct, 'tax_rate': tax_rate}, terminal_growth,
+            num_shares, cash_balance, manual_discount_rate=wacc_pct
+        )
+        return proj, drv, val, err
+    except Exception as e:
+        return None, None, None, str(e)
+
+
+def calculate_scenario_dcf(financials, wc_metrics, years, tax_rate,
+                            base_drivers, override_pct, flex_drivers,
+                            terminal_growth, num_shares, cash_balance,
+                            fixed_overrides=None):
+    """
+    Runs the combined Base / Best / Worst DCF, moving every lever in
+    flex_drivers TOGETHER (this is what makes it scenario analysis rather
+    than one-variable-at-a-time sensitivity analysis).
+
+    base_drivers: dict with keys 'growth', 'ebitda_margin', 'wacc',
+    'capex_ratio', 'wc_pct' — the base-case value for each lever.
+    fixed_overrides: dict of the non-flexed project_financials kwargs
+    (depreciation, WC days, interest rate) held constant across all cases.
+    """
+    fixed_overrides = fixed_overrides or {}
+    case_signs = {'Best Case': +1, 'Base Case': 0, 'Worst Case': -1}
+    results = {}
+    for case_name, sign in case_signs.items():
+        used = {
+            key: _scenario_driver_value(base_drivers[key], key, sign, override_pct, flex_drivers)
+            for key in base_drivers
+        }
+        proj, drv, val, err = _run_scenario_point(
+            financials, wc_metrics, years, tax_rate,
+            used['growth'], used['ebitda_margin'], used['wacc'], used['capex_ratio'], used['wc_pct'],
+            terminal_growth, num_shares, cash_balance, **fixed_overrides
+        )
+        results[case_name] = {
+            'projections': proj, 'drivers': drv, 'valuation': val, 'error': err,
+            'used': used,
+        }
+    return results
+
+
+def calculate_driver_tornado(financials, wc_metrics, years, tax_rate,
+                              base_drivers, override_pct, flex_drivers,
+                              terminal_growth, num_shares, cash_balance,
+                              fixed_overrides=None):
+    """
+    Isolates each lever ONE AT A TIME (all others held at base) to show how
+    much of the Base→Best/Worst swing each individual driver is responsible
+    for — a classic tornado chart. Complements the combined scenario view.
+    Returns a list of dicts sorted by swing size, largest first.
+    """
+    fixed_overrides = fixed_overrides or {}
+    tornado = []
+    for key in ['growth', 'ebitda_margin', 'wacc', 'capex_ratio', 'wc_pct']:
+        if key not in flex_drivers:
+            continue
+        favorable = dict(base_drivers)
+        unfavorable = dict(base_drivers)
+        favorable[key] = _scenario_driver_value(base_drivers[key], key, +1, override_pct, flex_drivers)
+        unfavorable[key] = _scenario_driver_value(base_drivers[key], key, -1, override_pct, flex_drivers)
+
+        _, _, val_up, err_up = _run_scenario_point(
+            financials, wc_metrics, years, tax_rate,
+            favorable['growth'], favorable['ebitda_margin'], favorable['wacc'],
+            favorable['capex_ratio'], favorable['wc_pct'],
+            terminal_growth, num_shares, cash_balance, **fixed_overrides
+        )
+        _, _, val_down, err_down = _run_scenario_point(
+            financials, wc_metrics, years, tax_rate,
+            unfavorable['growth'], unfavorable['ebitda_margin'], unfavorable['wacc'],
+            unfavorable['capex_ratio'], unfavorable['wc_pct'],
+            terminal_growth, num_shares, cash_balance, **fixed_overrides
+        )
+        if val_up and val_down and not err_up and not err_down:
+            fv_up = val_up['fair_value_per_share']
+            fv_down = val_down['fair_value_per_share']
+            tornado.append({
+                'driver': _SCENARIO_DRIVER_LABELS[key],
+                'favorable_fv': fv_up,
+                'unfavorable_fv': fv_down,
+                'swing': abs(fv_up - fv_down)
+            })
+    tornado.sort(key=lambda x: x['swing'], reverse=True)
+    return tornado
+
+
+def render_scenario_analysis_tab(financials, wc_metrics, years, tax_rate,
+                                  base_drivers, override_pct, flex_drivers, default_case,
+                                  terminal_growth, num_shares, cash_balance,
+                                  csym, current_price=0, key_prefix="scenario",
+                                  fixed_overrides=None, base_fair_value=None):
+    """
+    Scenario Analysis results view: comparison table, fair-value chart,
+    driver radar chart, and a tornado chart isolating each lever's swing.
+    The case / adjustment % / which-levers-to-flex choices are made ABOVE
+    the Run Valuation button (via render_scenario_settings_ui) — this tab
+    just displays the outcome and lets you browse the 3 already-computed
+    cases without re-running anything.
+    """
+    st.subheader("🎭 Scenario Analysis")
+    st.caption(
+        "Moves Revenue Growth, EBITDA Margin, WACC, CapEx Ratio and Working "
+        "Capital **together** under Base, Best and Worst case assumptions — "
+        "unlike Sensitivity Analysis, which flexes WACC and terminal growth "
+        "one at a time. Adjust the swing % and which levers move under "
+        "**🎭 Scenario Analysis Settings**, above the Run Valuation button."
+    )
+
+    if not flex_drivers:
+        st.warning("No levers are selected to flex. Enable at least one under Scenario Analysis Settings above.")
+        return
+
+    scenario_results = calculate_scenario_dcf(
+        financials, wc_metrics, years, tax_rate,
+        base_drivers, override_pct, flex_drivers,
+        terminal_growth, num_shares, cash_balance,
+        fixed_overrides=fixed_overrides
+    )
+
+    # ---------- Comparison table ----------
+    st.markdown("#### 📋 Scenario Comparison")
+    driver_order = ['growth', 'ebitda_margin', 'wacc', 'capex_ratio', 'wc_pct']
+    summary_rows = []
+    for case_name in ["Best Case", "Base Case", "Worst Case"]:
+        res = scenario_results.get(case_name, {})
+        val = res.get('valuation')
+        row = {'Scenario': case_name}
+        for key in driver_order:
+            label = _SCENARIO_DRIVER_LABELS[key]
+            if key in flex_drivers:
+                row[label] = f"{res['used'][key]:.2f}%"
+            else:
+                row[label] = "— (fixed)"
+        if val and not res.get('error'):
+            fv = val['fair_value_per_share']
+            row['Fair Value / Share'] = f"{csym}{fv:.2f}"
+            row['vs CMP'] = f"{((fv - current_price) / current_price * 100):+.1f}%" if current_price and current_price > 0 else "—"
+        else:
+            row['Fair Value / Share'] = "Error"
+            row['vs CMP'] = "—"
+        summary_rows.append(row)
+    summary_df = pd.DataFrame(summary_rows)
+
+    def _highlight_scenario(row):
+        color = {'Best Case': 'background-color: #d4f7dc', 'Worst Case': 'background-color: #fbd8d8'}.get(row['Scenario'], '')
+        return [color] * len(row)
+    try:
+        st.dataframe(summary_df.style.apply(_highlight_scenario, axis=1), use_container_width=True, hide_index=True)
+    except Exception:
+        st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+    # ---------- Selected case detail ----------
+    view_case = st.radio(
+        "View detail for:", ["Best Case", "Base Case", "Worst Case"],
+        index=["Best Case", "Base Case", "Worst Case"].index(default_case),
+        horizontal=True, key=f"{key_prefix}_view_case"
+    )
+    selected_res = scenario_results.get(view_case)
+
+    if selected_res and selected_res.get('valuation') and not selected_res.get('error'):
+        sel_val = selected_res['valuation']
+        st.markdown(f"#### 🎯 {view_case} Detail")
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            delta = None
+            if current_price and current_price > 0:
+                delta = f"{((sel_val['fair_value_per_share'] - current_price) / current_price * 100):+.1f}%"
+            st.metric("Fair Value / Share", f"{csym}{sel_val['fair_value_per_share']:.2f}", delta=delta)
+        with c2:
+            st.metric("Enterprise Value", f"{csym}{sel_val.get('enterprise_value', 0):.1f} Lacs")
+        with c3:
+            st.metric("Equity Value", f"{csym}{sel_val.get('equity_value', 0):.1f} Lacs")
+        with c4:
+            st.metric("Discount Rate Used", f"{selected_res['used']['wacc']:.2f}%")
+
+        # ---------- Fair value comparison chart ----------
+        case_order = ["Worst Case", "Base Case", "Best Case"]
+        fvs = []
+        for c in case_order:
+            r = scenario_results.get(c)
+            fvs.append(r['valuation']['fair_value_per_share'] if r and r.get('valuation') and not r.get('error') else 0)
+        fig_sc = go.Figure()
+        fig_sc.add_trace(go.Bar(
+            x=case_order, y=fvs,
+            marker_color=['#e74c3c', '#3498db', '#2ecc71'],
+            marker_line_color='#2c3e50', marker_line_width=1.5,
+            text=[f"{csym}{v:.2f}" for v in fvs], textposition='outside',
+            name='Fair Value / Share'
+        ))
+        if current_price and current_price > 0:
+            fig_sc.add_hline(y=current_price, line_dash="dash", line_color="black", line_width=2,
+                              annotation_text=f"Current Price: {csym}{current_price:.2f}",
+                              annotation_position="top left")
+        fig_sc.update_layout(
+            title="Fair Value Across Scenarios",
+            yaxis_title=f"Fair Value ({csym})", showlegend=False,
+            plot_bgcolor='rgba(240,240,240,0.4)', height=380
+        )
+        st.plotly_chart(fig_sc, use_container_width=True)
+
+        # ---------- Driver radar chart ----------
+        st.markdown("#### 🕸️ Driver Assumptions by Scenario")
+        radar_keys = [k for k in driver_order if k in flex_drivers]
+        if len(radar_keys) >= 3:
+            fig_radar = go.Figure()
+            radar_colors = {'Worst Case': '#e74c3c', 'Base Case': '#3498db', 'Best Case': '#2ecc71'}
+            base_vals = base_drivers
+            for c in ["Worst Case", "Base Case", "Best Case"]:
+                r = scenario_results.get(c)
+                if not r or r.get('error'):
+                    continue
+                # Normalize each lever as % of its own base value so all axes are comparable
+                vals = []
+                for k in radar_keys:
+                    b = base_vals[k]
+                    used_v = r['used'][k]
+                    vals.append((used_v / b * 100) if b else 100)
+                vals.append(vals[0])
+                labels = [_SCENARIO_DRIVER_LABELS[k] for k in radar_keys] + [_SCENARIO_DRIVER_LABELS[radar_keys[0]]]
+                fig_radar.add_trace(go.Scatterpolar(
+                    r=vals, theta=labels, fill='toself', name=c,
+                    line_color=radar_colors[c], opacity=0.6
+                ))
+            fig_radar.update_layout(
+                polar=dict(radialaxis=dict(visible=True, title="% of Base Case")),
+                showlegend=True, height=420,
+                title="Each Lever as % of its Base-Case Value"
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+        else:
+            st.caption("Select at least 3 levers under Scenario Analysis Settings to see the radar chart.")
+
+        # ---------- Tornado chart: which lever moves the needle most ----------
+        st.markdown("#### 🌪️ Driver Impact (Tornado Chart)")
+        st.caption("Each bar isolates ONE lever at a time (others held at base) to show its individual swing on fair value.")
+        tornado = calculate_driver_tornado(
+            financials, wc_metrics, years, tax_rate,
+            base_drivers, override_pct, flex_drivers,
+            terminal_growth, num_shares, cash_balance,
+            fixed_overrides=fixed_overrides
+        )
+        if tornado:
+            drivers_t = [t['driver'] for t in tornado]
+            base_fv_t = base_fair_value if base_fair_value else scenario_results['Base Case']['valuation']['fair_value_per_share']
+            low = [min(t['favorable_fv'], t['unfavorable_fv']) for t in tornado]
+            high = [max(t['favorable_fv'], t['unfavorable_fv']) for t in tornado]
+            fig_tor = go.Figure()
+            fig_tor.add_trace(go.Bar(
+                y=drivers_t, x=[h - l for h, l in zip(high, low)], base=low,
+                orientation='h', marker_color='#f39c12', marker_line_color='#c9770a', marker_line_width=1,
+                text=[f"{csym}{l:.2f} – {csym}{h:.2f}" for l, h in zip(low, high)],
+                textposition='inside', name='Fair Value Range'
+            ))
+            fig_tor.add_vline(x=base_fv_t, line_dash="dash", line_color="#2c3e50", line_width=2,
+                               annotation_text=f"Base: {csym}{base_fv_t:.2f}")
+            fig_tor.update_layout(
+                title="Fair Value Swing by Lever (Base ± Adjustment %)",
+                xaxis_title=f"Fair Value ({csym})", height=max(300, len(drivers_t) * 70),
+                plot_bgcolor='rgba(240,240,240,0.4)'
+            )
+            st.plotly_chart(fig_tor, use_container_width=True)
+        else:
+            st.caption("No levers selected — enable at least one under Scenario Analysis Settings.")
+    else:
+        err_msg = selected_res.get('error') if selected_res else 'Unknown error'
+        st.error(f"Could not compute {view_case}: {err_msg}")
+
+
+
 # ================================
 # MAIN UI FUNCTION
 # ================================
@@ -6357,22 +6714,10 @@ def main():
     mode = st.radio("Select Mode:", 
                     ["Listed Company (Yahoo Finance)", 
                      "Unlisted Company (Excel Upload)",
-                     "Screener Excel Mode (Screener.in Template)",
-                     "Bulk Valuation (Screener Web)"], 
+                     "Screener Excel Mode (Screener.in Template)"], 
                     horizontal=True)
 
-    if mode == "Bulk Valuation (Screener Web)":
-        from bulk_valuation import render_bulk_valuation_ui
-        render_bulk_valuation_ui(
-            classify_business_model=classify_business_model,
-            calculate_working_capital_metrics=calculate_working_capital_metrics,
-            project_financials=project_financials,
-            calculate_wacc=calculate_wacc,
-            calculate_dcf_valuation=calculate_dcf_valuation,
-            ensure_valid_number=ensure_valid_number,
-        )
-
-    elif mode == "Listed Company (Yahoo Finance)":
+    if mode == "Listed Company (Yahoo Finance)":
         st.subheader("📈 Listed Company Valuation")
 
         # ===== VALUATION DATE — controls what "today" means for Rf, Rm, and =====
@@ -7284,6 +7629,9 @@ def main():
             
             # Store current inputs
             st.session_state.previous_inputs_listed = current_inputs_listed
+        
+            st.markdown("---")
+            scenario_case_listed, scenario_pct_listed, scenario_drivers_listed = render_scenario_settings_ui("scenario_listed")
         
             st.markdown("---")
             st.markdown("### 🎯 Ready to Run Valuation")
@@ -8576,6 +8924,7 @@ def main():
                     "🎯 WACC Breakdown",
                     "🏆 Valuation Summary",
                     "📉 Sensitivity Analysis",
+                    "🎭 Scenario Analysis",
                     "📁 Comparative Valuation",
                     "🏢 Peer Comparison",
                     "💰 Dividend Discount Model",
@@ -8595,12 +8944,13 @@ def main():
                 tab4 = tabs_nonbank[3]
                 tab5 = tabs_nonbank[4]
                 tab6 = tabs_nonbank[5]
-                tab7 = tabs_nonbank[6]
-                tab8 = tabs_nonbank[7]
-                tab9 = tabs_nonbank[8]
-                tab10 = tabs_nonbank[9]
-                tab11 = tabs_nonbank[10]
-                tab_stock_nonbank = tabs_nonbank[11] if len(tabs_nonbank) > 11 else None
+                tab_scenario = tabs_nonbank[6]
+                tab7 = tabs_nonbank[7]
+                tab8 = tabs_nonbank[8]
+                tab9 = tabs_nonbank[9]
+                tab10 = tabs_nonbank[10]
+                tab11 = tabs_nonbank[11]
+                tab_stock_nonbank = tabs_nonbank[12] if len(tabs_nonbank) > 12 else None
                 
                 with tab1:
                     st.subheader("📊 Comprehensive Historical Financial Analysis")
@@ -8895,6 +9245,34 @@ def main():
                         st.dataframe(sensitivity_df, use_container_width=True)
                     
                         st.caption("Sensitivity table shows Fair Value per Share for different WACC and terminal growth rate combinations")
+                
+                with tab_scenario:
+                    _base_ebitda_margin = (projections['ebitda'][0] / projections['revenue'][0] * 100) \
+                        if projections['revenue'] and projections['revenue'][0] > 0 else drivers['avg_opex_margin']
+                    _base_wc_pct = (projections['wc'][0] / projections['revenue'][0] * 100) \
+                        if projections['revenue'] and projections['revenue'][0] > 0 else 0.0
+                    _base_drivers_listed = {
+                        'growth': drivers['avg_growth'],
+                        'ebitda_margin': _base_ebitda_margin,
+                        'wacc': wacc_details['wacc'],
+                        'capex_ratio': drivers['avg_capex_ratio'],
+                        'wc_pct': _base_wc_pct,
+                    }
+                    render_scenario_analysis_tab(
+                        financials, wc_metrics, projection_years_listed, tax_rate,
+                        _base_drivers_listed, scenario_pct_listed, scenario_drivers_listed, scenario_case_listed,
+                        terminal_growth, shares, cash_balance,
+                        _ticker_csym, current_price=current_price, key_prefix="scenario_listed",
+                        fixed_overrides={
+                            'depreciation_rate_override': depreciation_rate_override if depreciation_rate_override > 0 else None,
+                            'depreciation_method': depreciation_method,
+                            'inventory_days_override': inventory_days_override if inventory_days_override > 0 else None,
+                            'debtor_days_override': debtor_days_override if debtor_days_override > 0 else None,
+                            'creditor_days_override': creditor_days_override if creditor_days_override > 0 else None,
+                            'interest_rate_override': interest_rate_override if interest_rate_override > 0 else None,
+                        },
+                        base_fair_value=valuation['fair_value_per_share']
+                    )
                 
                 with tab7:
                     st.subheader("🔍 Comparative (Relative) Valuation")
@@ -10381,6 +10759,9 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
             st.session_state.previous_inputs_unlisted = current_inputs_unlisted
             
             st.markdown("---")
+            scenario_case_unlisted, scenario_pct_unlisted, scenario_drivers_unlisted = render_scenario_settings_ui("scenario_unlisted")
+            
+            st.markdown("---")
             st.markdown("### 🎯 Ready to Run Valuation")
             st.info("💡 **Click the button below to run valuation.** Results will appear only after clicking.")
             
@@ -10660,7 +11041,7 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
                     # ============================================
                     tab_list = ["📊 Historical Financials"]
                     if run_dcf_unlisted:
-                        tab_list.extend(["📋 Assumptions & Inputs", "📈 Projections", "💰 FCF Working", "🎯 WACC Calculation", "🏆 DCF Summary", "📉 Sensitivity Analysis"])
+                        tab_list.extend(["📋 Assumptions & Inputs", "📈 Projections", "💰 FCF Working", "🎯 WACC Calculation", "🏆 DCF Summary", "📉 Sensitivity Analysis", "🎭 Scenario Analysis"])
                     if run_rim_unlisted:
                         tab_list.append("📚 RIM Valuation")
                     if run_comp_unlisted and peer_tickers:
@@ -10927,6 +11308,37 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
                             st.dataframe(sensitivity_df, use_container_width=True)
                             
                             st.caption("Sensitivity table shows Fair Value per Share for different WACC and terminal growth rate combinations")
+                        
+                        tab_idx += 1
+                        
+                        # TAB: Scenario Analysis
+                        with tabs[tab_idx]:
+                            _base_ebitda_margin_u = (projections['ebitda'][0] / projections['revenue'][0] * 100) \
+                                if projections['revenue'] and projections['revenue'][0] > 0 else drivers['avg_opex_margin']
+                            _base_wc_pct_u = (projections['wc'][0] / projections['revenue'][0] * 100) \
+                                if projections['revenue'] and projections['revenue'][0] > 0 else 0.0
+                            _base_drivers_unlisted = {
+                                'growth': drivers['avg_growth'],
+                                'ebitda_margin': _base_ebitda_margin_u,
+                                'wacc': wacc_details['wacc'],
+                                'capex_ratio': drivers['avg_capex_ratio'],
+                                'wc_pct': _base_wc_pct_u,
+                            }
+                            render_scenario_analysis_tab(
+                                financials, wc_metrics, projection_years, tax_rate,
+                                _base_drivers_unlisted, scenario_pct_unlisted, scenario_drivers_unlisted, scenario_case_unlisted,
+                                terminal_growth, num_shares, cash_balance,
+                                _ticker_csym, current_price=0, key_prefix="scenario_unlisted",
+                                fixed_overrides={
+                                    'depreciation_rate_override': depreciation_rate_override_unlisted if depreciation_rate_override_unlisted > 0 else None,
+                                    'depreciation_method': depreciation_method_unlisted,
+                                    'inventory_days_override': inventory_days_override_unlisted if inventory_days_override_unlisted > 0 else None,
+                                    'debtor_days_override': debtor_days_override_unlisted if debtor_days_override_unlisted > 0 else None,
+                                    'creditor_days_override': creditor_days_override_unlisted if creditor_days_override_unlisted > 0 else None,
+                                    'interest_rate_override': interest_rate_override_unlisted if interest_rate_override_unlisted > 0 else None,
+                                },
+                                base_fair_value=valuation['fair_value_per_share']
+                            )
                         
                         tab_idx += 1
                     
@@ -11847,6 +12259,9 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
             st.session_state.previous_inputs_screener = current_inputs_screener
             
             st.markdown("---")
+            scenario_case_screener, scenario_pct_screener, scenario_drivers_screener = render_scenario_settings_ui("scenario_screener")
+            
+            st.markdown("---")
             st.markdown("### 🎯 Ready to Run Valuation")
             st.info("💡 **Click the button below to run valuation.** Results will appear only after clicking.")
             
@@ -12250,7 +12665,7 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
                     # Build tab list based on what was run
                     tab_list = ["📊 Historical Financials"]
                     if run_dcf_screener:
-                        tab_list.extend(["📋 Assumptions & Inputs", "📈 Projections", "💰 FCF Working", "🎯 WACC Calculation", "🏆 DCF Summary", "📉 Sensitivity Analysis"])
+                        tab_list.extend(["📋 Assumptions & Inputs", "📈 Projections", "💰 FCF Working", "🎯 WACC Calculation", "🏆 DCF Summary", "📉 Sensitivity Analysis", "🎭 Scenario Analysis"])
                     if run_ddm_screener:
                         tab_list.append("💸 DDM Valuation")
                     if run_rim_screener:
@@ -12708,6 +13123,38 @@ FAIR VALUE PER SHARE                      = {_ticker_csym}{rim_result['value_per
                                 st.error(f"Sensitivity chart error: {str(e)}")
                             
                             st.info("💡 **How to Read:** Each cell shows the fair value per share for different combinations of WACC and terminal growth rate. Darker green = higher valuation, darker red = lower valuation.")
+                        
+                        tab_idx += 1
+                        
+                        # Tab: Scenario Analysis
+                        with tabs[tab_idx]:
+                            _base_ebitda_margin_s = (projections_screener['ebitda'][0] / projections_screener['revenue'][0] * 100) \
+                                if projections_screener['revenue'] and projections_screener['revenue'][0] > 0 else drivers_screener['avg_opex_margin']
+                            _base_wc_pct_s = (projections_screener['wc'][0] / projections_screener['revenue'][0] * 100) \
+                                if projections_screener['revenue'] and projections_screener['revenue'][0] > 0 else 0.0
+                            _base_drivers_screener = {
+                                'growth': drivers_screener['avg_growth'],
+                                'ebitda_margin': _base_ebitda_margin_s,
+                                'wacc': wacc_details['wacc'],
+                                'capex_ratio': drivers_screener['avg_capex_ratio'],
+                                'wc_pct': _base_wc_pct_s,
+                            }
+                            render_scenario_analysis_tab(
+                                financials_screener, wc_metrics, projection_years_screener, tax_rate_screener,
+                                _base_drivers_screener, scenario_pct_screener, scenario_drivers_screener, scenario_case_screener,
+                                terminal_growth_screener, num_shares_screener, cash_balance,
+                                "₹", current_price=current_price_screener if 'current_price_screener' in locals() else 0,
+                                key_prefix="scenario_screener",
+                                fixed_overrides={
+                                    'depreciation_rate_override': depreciation_rate_override_screener if depreciation_rate_override_screener > 0 else None,
+                                    'depreciation_method': depreciation_method_screener,
+                                    'inventory_days_override': inventory_days_override_screener if inventory_days_override_screener > 0 else None,
+                                    'debtor_days_override': debtor_days_override_screener if debtor_days_override_screener > 0 else None,
+                                    'creditor_days_override': creditor_days_override_screener if creditor_days_override_screener > 0 else None,
+                                    'interest_rate_override': interest_rate_override_screener if interest_rate_override_screener > 0 else None,
+                                },
+                                base_fair_value=valuation['fair_value_per_share']
+                            )
                         
                         tab_idx += 1
                     
